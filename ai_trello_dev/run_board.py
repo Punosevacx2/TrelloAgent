@@ -29,7 +29,7 @@ import textwrap
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -56,7 +56,17 @@ LIST_SUCCESS = os.getenv("TRELLO_LIST_SUCCESS", "").strip()
 DEFAULT_BASE_BRANCH = os.getenv("DEFAULT_BASE_BRANCH", "main").strip()
 MAX_CARDS_PER_RUN = int(os.getenv("MAX_CARDS_PER_RUN", "3"))
 
-if not all([TRELLO_KEY, TRELLO_TOKEN, TRELLO_BOARD_ID, LIST_TODO, LIST_REVIEW, LIST_MADEPR, LIST_SUCCESS]):
+if not all(
+    [
+        TRELLO_KEY,
+        TRELLO_TOKEN,
+        TRELLO_BOARD_ID,
+        LIST_TODO,
+        LIST_REVIEW,
+        LIST_MADEPR,
+        LIST_SUCCESS,
+    ]
+):
     raise SystemExit(
         "Missing Trello env vars. Add TRELLO_KEY/TRELLO_TOKEN/TRELLO_BOARD_ID and list IDs in .env"
     )
@@ -105,6 +115,7 @@ def _detect_base_branch() -> str:
 # Trello client
 # -----------------------------
 
+
 @dataclass
 class TrelloCard:
     id: str
@@ -140,7 +151,9 @@ def trello_put(path: str, data: Dict[str, Any] | None = None) -> Any:
 
 
 def get_cards(list_id: str, limit: int = 10) -> List[TrelloCard]:
-    cards = trello_get(f"/lists/{list_id}/cards", params={"fields": "name,desc,shortLink,url,idList"})
+    cards = trello_get(
+        f"/lists/{list_id}/cards", params={"fields": "name,desc,shortLink,url,idList"}
+    )
     out: List[TrelloCard] = []
     for c in cards[:limit]:
         out.append(
@@ -167,6 +180,7 @@ def add_comment(card_id: str, text: str) -> None:
 # -----------------------------
 # CrewAI tools
 # -----------------------------
+
 
 @tool("shell")
 def shell(cmd: str) -> str:
@@ -243,27 +257,26 @@ DEV_TASK = Task(
         Steps:
         1) Use trello_get_cards(list_id="{LIST_TODO}", limit=1) to pick the top card.
         2) Read the card name + desc. Treat desc as requirements.
-        3) Create a new git branch named: ai/<shortLink>-<slugified-title>
-        4) Implement the changes in this repo. Keep diffs minimal.
-        5) Run tests:
-           - If this is a Python repo, run: pytest -q (if pytest exists).
-           - If ruff exists, run: ruff check .
-           - If black exists, run: black .
-        6) Commit with message: "feat/fix: <short title> (trello:<shortLink>)"
+        3) Ensure clean start:
+           - git checkout {_detect_base_branch()}
+           - git pull
+        4) Create a new git branch named: ai/<shortLink>-<slugified-title>
+        5) Implement the changes in this repo. Keep diffs minimal.
+        6) Commit with message: "feat: <short title> (trello:<shortLink>)"
         7) Push the branch to origin.
         8) Add a Trello comment with:
            - Branch name
            - What changed
-           - Test commands + results
+           - Note: "No automated tests configured in this repo."
         9) Move the card to Review list id="{LIST_REVIEW}".
 
         Constraints:
         - Do NOT modify more than 6 files unless truly necessary (explain in Trello comment).
-        - Do NOT skip tests unless there are none; if none, say so explicitly.
+        - Do NOT run pytest/ruff/black (repo has no tests).
         """
     ).strip(),
     agent=dev,
-    expected_output="Card moved to Review with branch pushed and tests run.",
+    expected_output="Card moved to Review with branch pushed and a Trello comment added.",
 )
 
 REVIEW_TASK = Task(
@@ -273,28 +286,25 @@ REVIEW_TASK = Task(
 
         Steps:
         1) Use trello_get_cards(list_id="{LIST_REVIEW}", limit=1)
-        2) Read the latest Trello comments (you cannot fetch them here), so infer needed info from:
-           - card desc
-           - and by inspecting git: list local branches, fetch, and locate branch name in recent commits.
-           Suggested commands:
-             - git fetch --all
-             - git branch -a
-             - git log --oneline -20
-             - git show --name-only --oneline -1
-           If you can’t confidently find the branch, ask for it by commenting on the card and move it back to ToDo.
-        3) Checkout the branch and review diff vs base.
-           - Detect base branch via: gh repo view --json defaultBranchRef --jq .defaultBranchRef.name
-           - Then: git diff <base>...HEAD
-        4) Run tests if available (pytest -q).
+        2) Find and checkout the branch by looking for commit messages containing trello:<shortLink>:
+           - git fetch --all
+           - git log --oneline -50
+           - git branch -a
+        3) Determine base branch:
+           - gh repo view --json defaultBranchRef --jq .defaultBranchRef.name
+        4) Review scope:
+           - git diff <base>...HEAD
         5) Decision:
-           A) If changes required:
+           A) If changes required / scope is wrong:
               - Add Trello comment: "Needs changes:" + bullet list of exact fixes
               - Move card back to ToDo id="{LIST_TODO}"
-           B) If approved:
+           B) If scope matches and looks OK:
               - Add Trello comment: "LGTM ✅ Ready for PR"
               - Move card to MadePR id="{LIST_MADEPR}"
 
-        Be precise. If rejecting, give concrete instructions.
+        Important:
+        - Do NOT run pytest/ruff/black.
+        - Focus on correctness + scope only.
         """
     ).strip(),
     agent=reviewer,
@@ -308,9 +318,9 @@ PR_TASK = Task(
 
         Steps:
         1) Use trello_get_cards(list_id="{LIST_MADEPR}", limit=1)
-        2) Find and checkout the corresponding branch (same approach as reviewer):
+        2) Find and checkout the corresponding branch:
            - git fetch --all
-           - git log --oneline -30 (look for trello:<shortLink>)
+           - git log --oneline -80 (look for trello:<shortLink>)
         3) Determine base branch:
            - gh repo view --json defaultBranchRef --jq .defaultBranchRef.name
         4) Create PR:
@@ -318,7 +328,7 @@ PR_TASK = Task(
            - Body: include:
              - What / Why
              - Summary of changes (3-6 bullets)
-             - Testing evidence (commands + results)
+             - Testing note: "No automated tests configured in this repo."
              - Trello link (card url)
            Command:
              gh pr create --title "<TITLE>" --body "<BODY>" --base <BASE>
@@ -335,6 +345,7 @@ PR_TASK = Task(
 # -----------------------------
 # Runner: process a few cards per run
 # -----------------------------
+
 
 def _has_any_cards(list_id: str) -> bool:
     return len(get_cards(list_id, limit=1)) > 0
